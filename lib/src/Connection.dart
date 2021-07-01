@@ -1,372 +1,232 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:cryptoutils/utils.dart';
 import 'package:xml/xml.dart' as xml;
+import 'package:xmpp/src/SessionRequestManager.dart';
 import 'package:synchronized/synchronized.dart';
-import 'package:xmpp_stone/src/ReconnectionManager.dart';
-import 'package:xmpp_stone/src/account/XmppAccountSettings.dart';
 
-import 'package:xmpp_stone/src/data/Jid.dart';
-import 'package:xmpp_stone/src/elements/nonzas/Nonza.dart';
-import 'package:xmpp_stone/src/elements/stanzas/AbstractStanza.dart';
-import 'package:xmpp_stone/src/extensions/ping/PingManager.dart';
-import 'package:xmpp_stone/src/features/ConnectionNegotatiorManager.dart';
-import 'package:xmpp_stone/src/features/streammanagement/StreamManagmentModule.dart';
-import 'package:xmpp_stone/src/parser/StanzaParser.dart';
-import 'package:xmpp_stone/src/presence/PresenceManager.dart';
-import 'package:xmpp_stone/src/roster/RosterManager.dart';
-import 'package:xmpp_stone/xmpp_stone.dart';
-
-import 'logger/Log.dart';
+import 'package:xmpp/src/BindingResourceManager.dart';
+import 'package:xmpp/src/ConnectionStateChangedListener.dart';
+import 'package:xmpp/src/StanzaListener.dart';
+import 'package:xmpp/src/data/Jid.dart';
+import 'package:xmpp/src/elements/stanzas/AbstractStanza.dart';
+import 'package:xmpp/src/parser/StanzaParser.dart';
+import 'package:xmpp/src/roster/RosterManager.dart';
+import 'package:xmpp/xmpp.dart';
 
 enum XmppConnectionState {
-  Idle,
   Closed,
-  SocketOpening,
-  SocketOpened,
-  DoneParsingFeatures,
-  StartTlsFailed,
-  AuthenticationNotSupported,
-  PlainAuthentication,
-  Authenticating,
+  ReceivingFeatures,
+  PLaidAuthentication,
+  Authentication,
+  StartTlsSent,
+  StartingTls,
   Authenticated,
+  InitialStreamUponAuthentication,
   AuthenticationFailure,
-  Resumed,
-  SessionInitialized,
-  Ready,
-  Closing,
-  ForcefullyClosed,
-  Reconnecting,
-  WouldLikeToOpen,
-  WouldLikeToClose,
+  BindingResources,
+  SessionInitiation,
+  SessionInitialized
 }
 
-class Connection {
-  var lock = Lock(reentrant: true);
+class Connection
+    implements BindingResourceCallBack, SessionRequestManagerCallback {
+  String streamOpeningString = """
+      <stream:stream
+      from='user@domain'
+  to='xmpp.jp'
+  version='1.0'
+  xml:lang='en'
+  xmlns='jabber:client'
+  xmlns:stream='http://etherx.jabber.org/streams'>""";
 
-  static String TAG = 'Connection';
+  var lock = new Lock(reentrant: true);
 
-  static Map<String, Connection> instances = <String, Connection>{};
+  String startTls = """<starttls xmlns="urn:ietf:params:xml:ns:xmpp-tls"/>""";
 
-  XmppAccountSettings account;
+  int _port;
+  String _streamId;
+  String _password;
+  Jid _fullJid;
+  bool waitingForSessionInitiation = false;
 
-  StreamManagementModule streamManagementModule;
+  List<StanzaProcessor> stanzaListeners = new List<StanzaProcessor>();
+  List<ConnectionStateChangedListener> connectionStateListeners =
+      new List<ConnectionStateChangedListener>();
 
-  Jid get serverName {
-    if (_serverName != null) {
-      return Jid.fromFullJid(_serverName);
-    } else {
-      return Jid.fromFullJid(fullJid.domain); //todo move to account.domain!
-    }
-  } //move this somewhere
+  Jid get fullJid => _fullJid;
 
-  String _serverName;
+  BindingResourceManager bindingResourceManager;
+  SessionRequestManager sessionRequestManager;
+  RosterManager rosterManager;
 
-  static Connection getInstance(XmppAccountSettings account) {
-    var connection = instances[account.fullJid.userAtDomain];
-    if (connection == null) {
-      connection = Connection(account);
-      instances[account.fullJid.userAtDomain] = connection;
-    }
-    return connection;
-  }
-
-  String _errorMessage;
-
-  String get errorMessage => _errorMessage;
-
-  set errorMessage(String value) {
-    _errorMessage = value;
-  }
-
-  bool authenticated = false;
-
-  final StreamController<AbstractStanza> _inStanzaStreamController =
-      StreamController.broadcast();
-
-  final StreamController<AbstractStanza> _outStanzaStreamController =
-      StreamController.broadcast();
-
-  final StreamController<Nonza> _inNonzaStreamController =
-      StreamController.broadcast();
-
-  final StreamController<Nonza> _outNonzaStreamController =
-      StreamController.broadcast();
-
-  final StreamController<XmppConnectionState> _connectionStateStreamController =
-      StreamController.broadcast();
-
-  Stream<AbstractStanza> get inStanzasStream {
-    return _inStanzaStreamController.stream;
-  }
-
-  Stream<Nonza> get inNonzasStream {
-    return _inNonzaStreamController.stream;
-  }
-
-  Stream<Nonza> get outNonzasStream {
-    return _inNonzaStreamController.stream;
-  }
-
-  Stream<AbstractStanza> get outStanzasStream {
-    return _outStanzaStreamController.stream;
-  }
-
-  Stream<XmppConnectionState> get connectionStateStream {
-    return _connectionStateStreamController.stream;
-  }
-
-  Jid get fullJid => account.fullJid;
-
-  ConnectionNegotiatorManager connectionNegotatiorManager;
-
+  @override
   void fullJidRetrieved(Jid jid) {
-    account.resource = jid.resource;
+    fullJid = jid;
+    if (_state == XmppConnectionState.BindingResources &&
+        waitingForSessionInitiation) {
+      _state = XmppConnectionState.SessionInitiation;
+      waitingForSessionInitiation = false;
+      initiateSession();
+    }
   }
 
-  Socket _socket;
-
-  // for testing purpose
-  set socket(Socket value) {
-    _socket = value;
+  set fullJid(Jid value) {
+    _fullJid = value;
   }
 
-  XmppConnectionState _state = XmppConnectionState.Idle;
+  Socket _socket = null;
+  Completer _completer;
+  XmppConnectionState _state = XmppConnectionState.Closed;
 
-  ReconnectionManager reconnectionManager;
+  //IqStanzaHandler iqStanzaHandler;
 
-  Connection(this.account) {
-    RosterManager.getInstance(this);
-    PresenceManager.getInstance(this);
+  Connection(String jid, String password, int port) {
+    _fullJid = Jid.fromFullJid(jid);
+    _password = password;
+    _port = port;
+    //iqStanzaHandler = new IqStanzaHandler(this);
+    bindingResourceManager = new BindingResourceManager(this);
+    addStanzaListener(bindingResourceManager);
+    sessionRequestManager = new SessionRequestManager(this);
+    addStanzaListener(sessionRequestManager);
+    rosterManager = RosterManager.getInstance(this);
     MessageHandler.getInstance(this);
-    PingManager.getInstance(this);
-    connectionNegotatiorManager = ConnectionNegotiatorManager(this, account);
-    reconnectionManager = ReconnectionManager(this);
   }
 
-  void _openStream() {
-    var streamOpeningString = """
-<?xml version='1.0'?>
-<stream:stream xmlns='jabber:client' version='1.0' xmlns:stream='http://etherx.jabber.org/streams'
-to='${fullJid.domain}'
-xml:lang='en'
->
-""";
-    write(streamOpeningString);
-  }
-
-  String restOfResponse = '';
-
-  String extractWholeChild(String response) {
-    return response;
-  }
-
-  String prepareStreamResponse(String response) {
-    Log.xmppp_receiving(response);
-    var response1 = extractWholeChild(restOfResponse + response);
-    if (response1.contains('</stream:stream>')) {
-      close();
-      return '';
-    }
-    if (response1.contains('stream:stream') &&
-        !(response1.contains('</stream:stream>'))) {
-      response1 = response1 +
-          '</stream:stream>'; // fix for crashing xml library without ending
-    }
-
-    //fix for multiple roots issue
-    response1 = '<xmpp_stone>$response1</xmpp_stone>';
-    return response1;
-  }
-
-  void reconnect() {
-    if (_state == XmppConnectionState.ForcefullyClosed) {
-      setState(XmppConnectionState.Reconnecting);
-      openSocket();
-    }
-  }
-
-  void connect() {
-    if (_state == XmppConnectionState.Closing) {
-      _state = XmppConnectionState.WouldLikeToOpen;
-    }
-    if (_state == XmppConnectionState.Closed) {
-      _state = XmppConnectionState.Idle;
-    }
-    if (_state == XmppConnectionState.Idle) {
-      openSocket();
-    }
-  }
-
-  Future<void> openSocket() async {
-    connectionNegotatiorManager.init();
-    setState(XmppConnectionState.SocketOpening);
-    try {
-      return await Socket.connect(account.host ?? account.domain, account.port)
-          .then((Socket socket) {
-        // if not closed in meantime
-        if (_state != XmppConnectionState.Closed) {
-          setState(XmppConnectionState.SocketOpened);
-          _socket = socket;
-          socket
-              .cast<List<int>>()
-              .transform(utf8.decoder)
-              .map(prepareStreamResponse)
-              .listen(handleResponse, onDone: handleConnectionDone);
-          _openStream();
-        } else {
-          Log.d(TAG, 'Closed in meantime');
-          socket.close();
-        }
-      });
-    } on SocketException catch (error) {
-      Log.e(TAG, 'Socket Exception' + error.toString());
-      handleConnectionError(error.toString());
-    }
+  Future open() {
+    _completer = new Completer();
+    Socket.connect(_fullJid.domain, _port).then((Socket socket) {
+      _socket = socket;
+      socket.transform(utf8.decoder).listen(handleResponse);
+      write(streamOpeningString);
+      setState(XmppConnectionState.ReceivingFeatures);
+    });
+    return _completer.future;
   }
 
   void close() {
-    if (state == XmppConnectionState.SocketOpening) {
-      throw Exception('Closing is not possible during this state');
-    }
-    if (state != XmppConnectionState.Closed &&
-        state != XmppConnectionState.ForcefullyClosed &&
-        state != XmppConnectionState.Closing) {
-      if (_socket != null) {
-        try {
-          setState(XmppConnectionState.Closing);
-          _socket.write('</stream:stream>');
-        } on Exception {
-          Log.d(TAG, 'Socket already closed');
-        }
-      }
-      authenticated = false;
-    }
+    _socket.write('</stream:stream>');
+    setState(XmppConnectionState.Closed);
+    _completer.complete();
   }
-
-  bool startMatcher(xml.XmlElement element) {
-    var name = element.name.local;
-    return name == 'stream';
-  }
-
-  bool stanzaMatcher(xml.XmlElement element) {
-    var name = element.name.local;
-    return name == 'iq' || name == 'message' || name == 'presence';
-  }
-
-  bool nonzaMatcher(xml.XmlElement element) {
-    var name = element.name.local;
-    return name != 'iq' && name != 'message' && name != 'presence';
-  }
-
-  bool featureMatcher(xml.XmlElement element) {
-    var name = element.name.local;
-    return (name == 'stream:features' || name == 'features');
-  }
-
-  String _unparsedXmlResponse = '';
 
   void handleResponse(String response) {
-    String fullResponse;
-    if (_unparsedXmlResponse.isNotEmpty) {
-      if (response.length > 12) {
-        fullResponse = '$_unparsedXmlResponse${response.substring(12)}'; //
-      } else {
-        fullResponse = _unparsedXmlResponse;
+      bool closeConnection = false;
+      if (response.contains("stream:stream") &&
+          !(response.contains("</stream>"))) {
+        response = response + "</stream>"; // fix for crashing xml library
       }
-      Log.v(TAG, 'full response = ${fullResponse}');
-      _unparsedXmlResponse = '';
-    } else {
-      fullResponse = response;
-    }
-
-    if (fullResponse != null && fullResponse.isNotEmpty) {
-      xml.XmlNode xmlResponse;
-      try {
-        xmlResponse = xml.XmlDocument.parse(fullResponse).firstChild;
-      } catch (e) {
-        _unparsedXmlResponse += fullResponse.substring(
-            0, fullResponse.length - 13); //remove  xmpp_stone end tag
-        xmlResponse = xml.XmlElement(xml.XmlName('error'));
+      if (response.contains("</stream:stream>")) {
+        closeConnection = true;
+        var index = response.lastIndexOf("</stream:stream>");
+        response = response.substring(0, index);
       }
-//      xmlResponse.descendants.whereType<xml.XmlElement>().forEach((element) {
-//        Log.d("element: " + element.name.local);
-//      });
-      //TODO: Improve parser for children only
-      xmlResponse.descendants
-          .whereType<xml.XmlElement>()
-          .where((element) => startMatcher(element))
-          .forEach((element) => processInitialStream(element));
+      print('handleResponse');
+      print(response);
+      if (response.isNotEmpty) {
+        var xmlResponse = xml.parse(response);
+        if (xmlResponse
+            .findElements("stream:stream")
+            .isNotEmpty) {
+          processInitialStream(xmlResponse);
+        }
+        xmlResponse.findElements('iq').forEach((element) {
+          var stanza = StanzaParser.parseStanza(element);
+          fireNewStanzaEvent(stanza);
+        });
+        if (xmlResponse
+            .findAllElements("stream:features")
+            .isNotEmpty) {
+          processFeatures(xmlResponse);
+        }
+        if (xmlResponse
+            .findAllElements("stream:error")
+            .isNotEmpty) {
+          processError(xmlResponse);
+        }
+        xmlResponse.findAllElements("proceed").forEach((element) {
+          if (_state == XmppConnectionState.StartTlsSent &&
+              element.attributes.firstWhere((attribute) =>
+              attribute.name.local == "xmlns" &&
+                  attribute.value == "urn:ietf:params:xml:ns:xmpp-tls") !=
+                  null) {
+            setState(XmppConnectionState.StartingTls);
+            startSecureSocket();
+          }
+        });
+        if (_state == XmppConnectionState.PLaidAuthentication) {
+          proccesAuthResponse(xmlResponse);
+        }
+        if (_state == XmppConnectionState.Authenticated) {
+          write(streamOpeningString);
+        }
+      }
+      if (closeConnection) {
+        print("closing Connection");
+        close();
+      }
+  }
 
-      xmlResponse.children
-          .whereType<xml.XmlElement>()
-          .where((element) => stanzaMatcher(element))
-          .map((xmlElement) => StanzaParser.parseStanza(xmlElement))
-          .forEach((stanza) => _inStanzaStreamController.add(stanza));
-
-      xmlResponse.descendants
-          .whereType<xml.XmlElement>()
-          .where((element) => featureMatcher(element))
-          .forEach((feature) =>
-              connectionNegotatiorManager.negotiateFeatureList(feature));
-
-      //TODO: Probably will introduce bugs!!!
-      xmlResponse.children
-          .whereType<xml.XmlElement>()
-          .where((element) => nonzaMatcher(element))
-          .map((xmlElement) => Nonza.parse(xmlElement))
-          .forEach((nonza) => _inNonzaStreamController.add(nonza));
+  void processInitialStream(xml.XmlDocument xmlResponse) {
+    print("processInitialStream");
+    xmlResponse
+        .findElements("stream:stream")
+        .forEach((element) => _streamId = element.getAttribute("id"));
+    if (_state == XmppConnectionState.Authenticated) {
+      setState(XmppConnectionState.InitialStreamUponAuthentication);
     }
   }
 
-  void processInitialStream(xml.XmlElement initialStream) {
-    Log.d(TAG, 'processInitialStream');
-    var from = initialStream.getAttribute('from');
-    if (from != null) {
-      _serverName = from;
+  void processFeatures(xml.XmlDocument xmlResponse) {
+    print("processing features");
+    xmlResponse.findAllElements("mechanisms").forEach((element) {
+      var mech = element.findElements("mechanism").toList();
+      if (mech.first.toString().contains("PLAIN")) {
+        setState(XmppConnectionState.PLaidAuthentication);
+        sendPlainAuthMessage();
+      }
+    });
+    if (xmlResponse.findAllElements("starttls").isNotEmpty) {
+      write(startTls);
+      setState(XmppConnectionState.StartTlsSent);
+    }
+
+    if (xmlResponse.findAllElements("bind").isNotEmpty) {
+      setState(XmppConnectionState.BindingResources);
+      write(bindingResourceManager.getBindRequestStanza().buildXmlString());
+    }
+
+    if (xmlResponse.findAllElements("session").isNotEmpty) {
+      if (_state == XmppConnectionState.BindingResources) {
+        waitingForSessionInitiation = true;
+      }
     }
   }
 
-  bool isOpened() {
-    return state != XmppConnectionState.Closed &&
-        state != XmppConnectionState.ForcefullyClosed &&
-        state != XmppConnectionState.Closing &&
-        state != XmppConnectionState.SocketOpening;
+  void sendPlainAuthMessage() {
+    var authString = '\u0000' + _fullJid.local + '\u0000' + _password;
+    var bytes = utf8.encode(authString);
+    var base64 = CryptoUtils.bytesToBase64(bytes);
+    String message =
+        "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>${base64}</auth>";
+    write(message);
   }
 
   void write(message) {
-    Log.xmppp_sending(message);
-    if (isOpened()) {
-      _socket.write(message);
-    }
+    print("sending: " + message);
+    _socket.write(message);
   }
 
   void writeStanza(AbstractStanza stanza) {
-    _outStanzaStreamController.add(stanza);
     write(stanza.buildXmlString());
-  }
-
-  void writeNonza(Nonza nonza) {
-    _outNonzaStreamController.add(nonza);
-    write(nonza.buildXmlString());
   }
 
   void setState(XmppConnectionState state) {
     _state = state;
     _fireConnectionStateChangedEvent(state);
-    _processState(state);
-    Log.d(TAG, 'State: ${_state}');
-  }
-
-  XmppConnectionState get state {
-    return _state;
-  }
-
-  void _processState(XmppConnectionState state) {
-    if (state == XmppConnectionState.Authenticated) {
-      authenticated = true;
-      _openStream();
-    }
+    print("State: ${_state}");
   }
 
   void processError(xml.XmlDocument xmlResponse) {
@@ -374,28 +234,63 @@ xml:lang='en'
   }
 
   void startSecureSocket() {
-    Log.d(TAG, 'startSecureSocket');
-    SecureSocket.secure(_socket, onBadCertificate: _validateBadCertificate)
-        .then((secureSocket) {
+    //todo do we need to close oldSocket?
+    print(startSecureSocket);
+    SecureSocket.secure(_socket).then((secureSocket) {
       _socket = secureSocket;
-      _socket
-          .cast<List<int>>()
-          .transform(utf8.decoder)
-          .map(prepareStreamResponse)
-          .listen(handleResponse,
-              onError: (error) =>
-                  {handleSecuredConnectionError(error.toString())},
-              onDone: handleSecuredConnectionDone);
-      _openStream();
+      _socket.transform(utf8.decoder).listen(handleResponse);
+      write(streamOpeningString);
+    });
+  }
+
+  void proccesAuthResponse(xml.XmlDocument xmlResponse) {
+    xmlResponse.findAllElements("success").forEach((element) {
+      if (elementHasAttribute(
+          element,
+          xml.XmlAttribute(
+              xml.XmlName("xmlns"), "urn:ietf:params:xml:ns:xmpp-sasl"))) {
+        setState(XmppConnectionState.Authenticated);
+        return;
+      }
+    });
+    xmlResponse.findAllElements("failure").forEach((element) {
+      if (elementHasAttribute(
+          element,
+          xml.XmlAttribute(
+              xml.XmlName("xmlns"), "urn:ietf:params:xml:ns:xmpp-sasl"))) {
+        setState(XmppConnectionState.AuthenticationFailure);
+        return;
+      }
     });
   }
 
   void fireNewStanzaEvent(AbstractStanza stanza) {
-    _inStanzaStreamController.add(stanza);
+      print("FireNewStanza");
+      stanzaListeners.forEach((listener) => listener.processStanza(stanza));
+  }
+
+  void addStanzaListener(StanzaProcessor listener) {
+      print("addStanzaListener");
+      stanzaListeners.add(listener);
+  }
+
+  void removeStanzaListener(StanzaProcessor listener) {
+    stanzaListeners.remove(listener);
   }
 
   void _fireConnectionStateChangedEvent(XmppConnectionState state) {
-    _connectionStateStreamController.add(state);
+    connectionStateListeners
+        .forEach((listener) => listener.onConnectionStateChanged(state));
+  }
+
+  void addConnectionStateChangedListener(
+      ConnectionStateChangedListener listener) {
+    connectionStateListeners.add(listener);
+  }
+
+  void removeConnectionStateChangedListener(
+      ConnectionStateChangedListener listener) {
+    connectionStateListeners.remove(listener);
   }
 
   bool elementHasAttribute(xml.XmlElement element, xml.XmlAttribute attribute) {
@@ -407,62 +302,16 @@ xml:lang='en'
     return list != null;
   }
 
+  //should work with connection state changed
+  void initiateSession() {
+    write(sessionRequestManager
+        .getSessionRequestStanza(fullJid.domain)
+        .buildXmlString());
+  }
+
+  @override
   void sessionReady() {
     setState(XmppConnectionState.SessionInitialized);
     //now we should send presence
-  }
-
-  void doneParsingFeatures() {
-    if (state == XmppConnectionState.SessionInitialized) {
-      setState(XmppConnectionState.Ready);
-    }
-  }
-
-  void startTlsFailed() {
-    setState(XmppConnectionState.StartTlsFailed);
-    close();
-  }
-
-  void authenticating() {
-    setState(XmppConnectionState.Authenticating);
-  }
-
-  bool _validateBadCertificate(X509Certificate certificate) {
-    return true;
-  }
-
-  void handleConnectionDone() {
-    Log.d(TAG, 'Handle connection done');
-    handleCloseState();
-  }
-
-  void handleSecuredConnectionDone() {
-    Log.d(TAG, 'Handle secured connection done');
-    handleCloseState();
-  }
-
-  void handleConnectionError(String error) {
-    handleCloseState();
-  }
-
-  void handleCloseState() {
-    if (state == XmppConnectionState.WouldLikeToOpen) {
-      setState(XmppConnectionState.Closed);
-      connect();
-    } else if (state != XmppConnectionState.Closing) {
-      setState(XmppConnectionState.ForcefullyClosed);
-    } else {
-      setState(XmppConnectionState.Closed);
-    }
-  }
-
-  void handleSecuredConnectionError(String error) {
-    Log.d(TAG, 'Handle Secured Error  $error');
-    handleCloseState();
-  }
-
-  bool isAsyncSocketState() {
-    return state == XmppConnectionState.SocketOpening ||
-        state == XmppConnectionState.Closing;
   }
 }
